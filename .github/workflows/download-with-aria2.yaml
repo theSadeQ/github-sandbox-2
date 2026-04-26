@@ -1,104 +1,117 @@
-name: Auto-Download from Commit Message
-
+name: Archive Webpages & Split Large Files
 on:
   push:
-    # This triggers the workflow on any push to any branch.
+    branches:
+      - "**"
 
 permissions:
-  # Crucial: Gives the runner permission to push the downloaded files back
   contents: write
 
 jobs:
-  download-and-commit:
+  archive-and-save:
     runs-on: ubuntu-latest
-
     steps:
-      # 1. Check out the repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2 # Ensures we have the commit history to read the message
+          fetch-depth: 0
 
-      # 2. Install aria2 and monolith
       - name: Install dependencies
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          # Install zip to ensure we can split files, and wget for downloading monolith
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y wget zip unzip
           
-          # Install monolith manually from GitHub releases since it's not in apt
-          wget https://github.com/Y2Z/monolith/releases/latest/download/monolith-gnu-linux-x86_64 -O monolith
+          # Install monolith binary
+          wget -qO monolith https://github.com/Y2Z/monolith/releases/download/v2.8.1/monolith-gnu-linux-x86_64
           chmod +x monolith
           sudo mv monolith /usr/local/bin/
+          monolith --version
 
-      # 3. Parse commit message and download
-      - name: Parse and Download
-        env:
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+      - name: Parse, Download, and Split
         run: |
-          set -euxo pipefail
-
-          # Extract URLs using grep. 
-          # '|| true' ensures the script doesn't crash if no URLs are found.
-          urls=$(echo "$COMMIT_MESSAGE" | grep -Eo 'https?://[^ ]+' || true)
-
-          if [ -z "$urls" ]; then
-            echo "No URLs found in the commit message. Exiting."
+          set -euo pipefail
+          
+          # Extract commit message
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
+          
+          # Safely extract URLs starting with http:// or https://
+          # Using grep -E instead of grep -P to avoid UTF-8 Exit Code 2 errors
+          URLS=$(echo "$MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
+          
+          if [ -z "$URLS" ]; then
+            echo "❌ No URLs found in the commit message."
             exit 0
           fi
-
-          # Process each URL safely using a Here-String
+          
+          # Create temporary processing dir and final output dir
+          mkdir -p tmp_downloads downloads
+          
+          # 1. DOWNLOAD PHASE
           while IFS= read -r url; do
-            # Skip empty lines
             [ -z "$url" ] && continue
-
-            # Strip trailing punctuation (like periods or commas)
-            clean_url=$(echo "$url" | sed 's/[.,;]*$//')
-            echo "Processing: $clean_url"
-
-            # Check if it's an HTML page/directory or a general file
-            if [[ "$clean_url" == *.html || "$clean_url" == *.htm || "$clean_url" == */ ]]; then
-              echo "Detected webpage. Using monolith..."
-              # Create a safe filename, truncate to 50 chars to prevent OS filename limits
-              safe_name=$(echo "$clean_url" | sed -e 's/[^A-Za-z0-9._-]/_/g' | cut -c 1-50)
+            
+            # Strip trailing punctuation for cleaner links
+            clean_url=$(echo "$url" | sed -E 's/[.,;)]+$//')
+            
+            # Create a safe filename (replace weird characters with underscores)
+            safe_name=$(echo "$clean_url" | sed -E 's/[^a-zA-Z0-9]/_/g')
+            # Truncate to 150 chars to avoid OS "File name too long" errors
+            filename="${safe_name:0:150}.html"
+            
+            echo "⬇️ Archiving: $clean_url"
+            
+            # Run monolith. 
+            # Removed -i to KEEP images. 
+            # -f (no iframes/ads), -v (no videos), -a (no audio)
+            monolith -f -v -a "$clean_url" -o "tmp_downloads/$filename" || echo "::warning::Failed to archive $clean_url"
+          done <<< "$URLS"
+          
+          # 2. SPLIT PHASE
+          for FILE in tmp_downloads/*; do
+            # Skip if no files exist
+            [ -f "$FILE" ] || continue
+            
+            SIZE=$(stat -c%s "$FILE")
+            LIMIT=$((90 * 1024 * 1024)) # 90 MB in bytes
+            BASENAME=$(basename "$FILE")
+            
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — larger than 90MB. Splitting with zip..."
               
-              # '|| echo ...' prevents a single failed download from failing the whole job
-              monolith "$clean_url" -o "${safe_name}.html" || echo "::warning::Monolith failed on $clean_url"
+              # zip -s creates: file.zip, file.z01, file.z02, etc.
+              # -j removes the 'tmp_downloads/' folder structure from inside the zip
+              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
+              
+              echo "✅ Created Parts: $(ls downloads/${BASENAME}* | wc -l)"
             else
-              echo "Detected file. Using aria2c..."
-              # --parameterized-uri=false prevents Exit Code 2 on complex URLs
-              aria2c --parameterized-uri=false "$clean_url" || echo "::warning::aria2c failed on $clean_url"
+              echo "✅ $BASENAME is $(( SIZE / 1024 / 1024 ))MB. No splitting needed."
+              cp "$FILE" "downloads/$BASENAME"
             fi
-          done <<< "$urls"
-
-      # 4. Save the files to the repo
-      - name: Commit downloads
-        run: |
-          set -euxo pipefail
-          
-          # Set up the bot's Git identity
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # PREVENT GITHUB 100MB LIMIT ERROR:
-          # Find files over 95MB (excluding the hidden .git folder) and remove them
-          find . -type f -size +95M ! -path "./.git/*" | while read -r large_file; do
-            echo "::warning::File '$large_file' is too large for GitHub (>95MB). Skipping commit."
-            rm "$large_file"
           done
           
-          # Stage the newly downloaded files (large ones are now removed)
-          git add .
+          # Clean up the temporary heavy files
+          rm -rf tmp_downloads
+
+      - name: Commit and Push
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME}"
           
-          # Check if there are actually any changes to commit
-          if [ -n "$(git status --porcelain)" ]; then
-            git commit -m "Auto-downloaded files from commit URLs"
-            
-            # Pull with rebase to synchronize the branch before pushing
-            git pull --rebase origin ${GITHUB_REF_NAME}
-            
-            # Push changes to the branch that triggered the action
-            git push origin HEAD:${GITHUB_REF_NAME}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add the contents of the downloads folder
+          git add downloads/
+          
+          # Check if there are actually files to commit to prevent errors
+          if git diff --cached --quiet; then
+            echo "No new downloads to commit."
           else
-            echo "No new downloaded files to commit."
+            git commit -m "Add downloaded files from commit [skip ci]"
+            echo "🚀 Pushing to branch: $BRANCH"
+            git pull --rebase origin $BRANCH
+            git push origin HEAD:$BRANCH
           fi
