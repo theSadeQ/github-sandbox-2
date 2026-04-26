@@ -1,13 +1,11 @@
-name: Download URLs from Commit Message
+name: Auto-Download from Commit Message
 
-# Trigger the workflow whenever a push is made to the repository
 on:
   push:
-    branches:
-      - main # Note: Change this to 'master' if your default branch is named master
+    # This triggers the workflow on any push to any branch.
 
-# GRANT PERMISSIONS: This is required so the bot is legally allowed to push files back
 permissions:
+  # Crucial: Gives the runner permission to push the downloaded files back
   contents: write
 
 jobs:
@@ -15,84 +13,61 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the code
+      # 1. Check out the repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # fetch-depth: 0 pulls the entire history so 'git log' can properly read the commit message
-          fetch-depth: 0
+          fetch-depth: 2 # Ensures we have the commit history to read the message
 
-      # 2. Install Tools (aria2 via apt, monolith via direct download)
+      # 2. Install aria2 and monolith
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          
-          # Install aria2
           sudo apt-get install -y aria2
           
-          # Download and install monolith directly since it's not in apt
-          echo "Downloading monolith..."
-          wget -q https://github.com/Y2Z/monolith/releases/latest/download/monolith-gnu-linux-x86_64 -O monolith
+          # Install monolith manually from GitHub releases since it's not in apt
+          wget https://github.com/Y2Z/monolith/releases/latest/download/monolith-gnu-linux-x86_64 -O monolith
           chmod +x monolith
           sudo mv monolith /usr/local/bin/
-          
-          # Verify installations
-          aria2c --version | head -n 1
-          monolith --version
 
-      # 3. Read the message, extract URLs, and download
-      - name: Parse commit and download
+      # 3. Parse commit message and download
+      - name: Parse and Download
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          # Strict bash mode: fail on hidden errors, log all commands
           set -euxo pipefail
-          
-          # Get the latest commit message
-          MESSAGE=$(git log -1 --pretty=format:"%B")
-          
-          # Extract URLs safely (|| true prevents grep from failing the script if no URLs exist)
-          urls=$(echo "$MESSAGE" | grep -Eo 'https?://[^ ]+' || true)
-          
-          # Stop cleanly if there are no URLs
+
+          # Extract URLs using grep. 
+          # '|| true' ensures the script doesn't crash if no URLs are found.
+          urls=$(echo "$COMMIT_MESSAGE" | grep -Eo 'https?://[^ ]+' || true)
+
           if [ -z "$urls" ]; then
-            echo "No URLs found in the commit message."
+            echo "No URLs found in the commit message. Exiting."
             exit 0
           fi
-          
-          # Read through the URLs line by line
-          while read -r url; do
-            if [ -z "$url" ]; then
-              continue
-            fi
-            
-            # Sanitize: Remove accidental trailing punctuation caught by regex
-            url=$(echo "$url" | sed -E 's/[.,;)]+$//')
-            echo "Processing URL: $url"
-            
-            # Extract filename from URL
-            FILENAME=$(basename "$url")
-            if [ -z "$FILENAME" ] || [ "$FILENAME" = "/" ]; then
-              FILENAME="index.html"
-            fi
-            
-            # Strip query parameters (?id=123) from the filename string
-            FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
-            
-            # Truncate filename to max 200 chars to avoid OS file system limits
-            FILENAME=${FILENAME:0:200}
-            
-            # Logic branch: Use monolith for webpages, aria2c for files
-            if echo "$url" | grep -iqE '\.html?$|/$' || [ "$FILENAME" = "index.html" ]; then
-              echo "Saving webpage with monolith..."
-              # 'if !' syntax catches 403 Forbidden errors so the workflow logs a warning instead of crashing
-              if ! monolith "$url" -o "$FILENAME.html"; then
-                echo "::warning::Monolith failed to download $url. The site might be blocking bots."
-              fi
+
+          # Process each URL safely using a Here-String
+          while IFS= read -r url; do
+            # Skip empty lines
+            [ -z "$url" ] && continue
+
+            # Strip trailing punctuation (like periods or commas)
+            clean_url=$(echo "$url" | sed 's/[.,;]*$//')
+            echo "Processing: $clean_url"
+
+            # Check if it's an HTML page/directory or a general file
+            if [[ "$clean_url" == *.html || "$clean_url" == *.htm || "$clean_url" == */ ]]; then
+              echo "Detected webpage. Using monolith..."
+              # Create a safe filename, truncate to 50 chars to prevent OS filename limits
+              safe_name=$(echo "$clean_url" | sed -e 's/[^A-Za-z0-9._-]/_/g' | cut -c 1-50)
+              
+              # '|| echo ...' prevents a single failed download from failing the whole job
+              monolith "$clean_url" -o "${safe_name}.html" || echo "::warning::Monolith failed on $clean_url"
             else
-              echo "Downloading file with aria2c..."
-              # --parameterized-uri=false stops aria2c from crashing with exit code 2 on bracketed links
-              if ! aria2c --parameterized-uri=false "$url"; then
-                echo "::warning::aria2c failed to download $url."
-              fi
+              echo "Detected file. Using aria2c..."
+              # --parameterized-uri=false prevents Exit Code 2 on complex URLs
+              aria2c --parameterized-uri=false "$clean_url" || echo "::warning::aria2c failed on $clean_url"
             fi
           done <<< "$urls"
 
@@ -105,17 +80,24 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Stage the newly downloaded files
+          # PREVENT GITHUB 100MB LIMIT ERROR:
+          # Find files over 95MB (excluding the hidden .git folder) and remove them
+          find . -type f -size +95M ! -path "./.git/*" | while read -r large_file; do
+            echo "::warning::File '$large_file' is too large for GitHub (>95MB). Skipping commit."
+            rm "$large_file"
+          done
+          
+          # Stage the newly downloaded files (large ones are now removed)
           git add .
           
-          # Check if there are actually any changes (prevents git commit from crashing if downloads failed)
+          # Check if there are actually any changes to commit
           if [ -n "$(git status --porcelain)" ]; then
             git commit -m "Auto-downloaded files from commit URLs"
             
-            # Pull with rebase: This prevents 'Non-Fast-Forward' push rejections if the repo changed while downloading
+            # Pull with rebase to synchronize the branch before pushing
             git pull --rebase origin ${GITHUB_REF_NAME}
             
-            # Push changes to the branch that triggered the workflow
+            # Push changes to the branch that triggered the action
             git push origin HEAD:${GITHUB_REF_NAME}
           else
             echo "No new downloaded files to commit."
