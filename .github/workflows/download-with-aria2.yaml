@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+# 1. FIX: Explicitly grant write permissions so `git push` doesn't fail with 128
+permissions:
+  contents: write
+
 jobs:
   download:
     runs-on: ubuntu-latest
@@ -20,7 +24,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wget aria2 zip bc
           
-          # Install monolith safely
           wget -q --show-progress https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O monolith
           chmod +x monolith
           sudo mv monolith /usr/local/bin/
@@ -29,21 +32,18 @@ jobs:
         run: |
           set -euo pipefail
           
-          # 1. Safely extract commit message
           COMMIT_MSG=$(git log -1 --pretty=%B)
           printf "Commit message:\n%s\n" "$COMMIT_MSG"
           
-          # 2. Extract URLs securely
           URLS=$(printf '%s\n' "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
           
           if [ -z "$URLS" ]; then
             echo "No URLs found in commit message"
-            exit 0
+            exit 0 
           fi
           
           mkdir -p downloads
           
-          # 3. Process URLs via Here-String
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             
@@ -52,20 +52,35 @@ jobs:
             
             if printf '%s\n' "$url" | grep -qE '\.(zip|tar|gz|pdf|exe|dmg|apk|jpg|png|mp4|mp3)([?]|$)'; then
               echo "Downloading file..."
-              wget -P downloads/ "$url" || aria2c --parameterized-uri=false -d downloads/ "$url" || echo "Download failed: $url"
+              wget -P downloads/ "$url" || aria2c --parameterized-uri=false -d downloads/ "$url" || echo "Download failed"
             else
               echo "Archiving webpage..."
               FILENAME=$(printf '%s\n' "$url" | sed -E 's|https?://||' | sed 's|[^a-zA-Z0-9]|_|g')
               FILENAME=${FILENAME:0:200} 
-              monolith "$url" -o "downloads/${FILENAME}.html" || echo "Archive failed: $url"
+              monolith "$url" -o "downloads/${FILENAME}.html" || echo "Archive failed"
             fi
           done <<< "$URLS"
 
-      # NEW APPROACH: Upload as Artifact instead of Git Commit
-      - name: Upload Downloads as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: commit-downloads
-          path: downloads/
-          if-no-files-found: ignore
-          retention-days: 30
+      - name: Commit downloads
+        run: |
+          # Enforce error handling
+          set -euo pipefail
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 2. Add the directory. If it doesn't exist or is empty, Git ignores it safely.
+          mkdir -p downloads
+          git add downloads/
+          
+          # 3. FIX: Use git diff to check if files were actually staged
+          # --quiet means exit with 1 if there are differences, 0 if no differences
+          if ! git diff --cached --quiet; then
+            echo "Changes detected, committing..."
+            git commit -m "Add downloaded files from commit"
+            
+            # Push explicitly to the current branch to avoid detached HEAD issues
+            git push origin HEAD:${GITHUB_REF}
+          else
+            echo "No new files were downloaded or changed. Skipping commit."
+          fi
