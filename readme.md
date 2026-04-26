@@ -1,2 +1,1 @@
-download: https://www.tiktok.com/@jaedengomezz
-1
+download: https://www.instagram.com/jaedengomez/
