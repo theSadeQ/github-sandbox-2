@@ -1,127 +1,94 @@
-name: Auto Download on Commit Command
+name: Download from Commit & Save to Repo
 
 on:
   push:
     branches:
-      - '**'
+      - "**"
 
-permissions:
-  contents: write
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   download:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
+    permissions:
+      contents: write
 
-      - name: Install dependencies
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 wget zip
 
-      - name: Parse commit message and download
+      - name: Parse commit and download
         run: |
-          set -u
+          set -e
 
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "Commit message:"
-          echo "$COMMIT_MSG"
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $MSG"
 
-          if ! echo "$COMMIT_MSG" | grep -qE '(download:|download-zip:)'; then
+          MODE=""
+          URLS=""
+
+          if echo "$MSG" | grep -q "download-zip:"; then
+            MODE="zip"
+            URLS=$(echo "$MSG" | sed -n 's/.*download-zip:[[:space:]]*//p')
+          elif echo "$MSG" | grep -q "download:"; then
+            MODE="normal"
+            URLS=$(echo "$MSG" | sed -n 's/.*download:[[:space:]]*//p')
+          else
             echo "No download command found"
             exit 0
           fi
 
-          MODE="normal"
-          echo "$COMMIT_MSG" | grep -q 'download-zip:' && MODE="zip"
-          echo "Mode: $MODE"
-
-          URLS=$(echo "$COMMIT_MSG" \
-            | sed -n 's/.*download-zip:[[:space:]]*//p; s/.*download:[[:space:]]*//p')
-
-          if [ -z "$URLS" ]; then
-            echo "No URLs detected"
-            exit 0
-          fi
-
-          rm -rf tmp_downloads
           mkdir -p tmp_downloads downloads
-
-          cd tmp_downloads
 
           for URL in $URLS; do
             echo "Downloading: $URL"
 
-            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso)$ ]]; then
-              aria2c -x 8 -s 8 "$URL" || wget -c "$URL" || true
+            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|webp|mp4|zip|pdf|mp3|tar|gz|7z)$ ]]; then
+              aria2c -d tmp_downloads "$URL"
             else
               wget \
                 --page-requisites \
                 --convert-links \
-                --adjust-extension \
-                --span-hosts \
                 --no-parent \
-                -e robots=off \
-                "$URL" || true
+                -P tmp_downloads \
+                "$URL"
             fi
           done
 
-          cd ..
-
-          if [ -z "$(find tmp_downloads -type f)" ]; then
-            echo "Nothing downloaded"
-            exit 0
-          fi
-
-          LIMIT=$((90*1024*1024))
-
           if [ "$MODE" = "zip" ]; then
-            NAME="download_$(date +%Y%m%d_%H%M%S)"
-            zip -r "${NAME}.zip" tmp_downloads
-
-            SIZE=$(stat -c%s "${NAME}.zip")
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              rm "${NAME}.zip"
-              cd tmp_downloads
-              zip -s 90m -r "../downloads/${NAME}.zip" .
-              cd ..
-            else
-              mv "${NAME}.zip" downloads/
-            fi
+            ZIP="downloads/archive_$(date +%s).zip"
+            zip -r "$ZIP" tmp_downloads/*
           else
-            find tmp_downloads -type f | while read FILE; do
-              SIZE=$(stat -c%s "$FILE")
-              BASE=$(basename "$FILE")
-
-              if [ "$SIZE" -gt "$LIMIT" ]; then
-                TMP=$(mktemp -d)
-                cp "$FILE" "$TMP/"
-                cd "$TMP"
-                zip -s 90m "${BASE}.zip" "$BASE"
-                mv *.zip "$GITHUB_WORKSPACE/downloads/"
-                cd "$GITHUB_WORKSPACE"
-                rm -rf "$TMP"
-              else
-                mv "$FILE" downloads/
-              fi
-            done
+            cp -r tmp_downloads/* downloads/ || true
           fi
 
-      - name: Commit downloaded files
+          LIMIT=$((90 * 1024 * 1024))
+
+          for FILE in downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Splitting $FILE"
+              zip -s 90m "${FILE}.zip" "$FILE"
+              rm "$FILE"
+            fi
+          done
+
+      - name: Commit files
         run: |
           git config user.name "github-actions"
-          git config user.email "actions@github.com"
+          git config user.email "github-actions@github.com"
 
-          git add downloads
+          git add downloads/
 
-          if git diff --cached --quiet; then
-            echo "Nothing to commit"
-            exit 0
-          fi
+          git commit -m "Add downloaded files [skip ci]" || echo "Nothing to commit"
 
-          git commit -m "Add downloaded files from commit command"
           git push
