@@ -1,56 +1,64 @@
-name: Webpage Screenshot Archiver
-
+name: Screenshot Archiver
 on:
   push:
-    paths-ignore:
-      - '**/*.png'
-      - '**/*.zip'
-  workflow_dispatch:
+    branches:
+      - main # Change this if your default branch is 'master'
 
 jobs:
-  screenshot:
+  archive:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
+    
     steps:
+      # 1. Boilerplate: Get the code and setup Node.js
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 2 # We need this to read the commit message
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
+      # 2. Install Playwright and the Stealth plugins
       - name: Install Playwright and Dependencies
         run: |
           npm init -y
-          npm install playwright
+          # Install playwright-extra and the stealth plugin to avoid Cloudflare blocks
+          npm install playwright playwright-extra puppeteer-extra-plugin-stealth
           npx playwright install --with-deps chromium
 
+      # 3. Create our stealthy archiver script
       - name: Create Archiver Script
         run: |
           cat << 'EOF' > archiver.js
-          const { chromium } = require('playwright');
+          const { chromium } = require('playwright-extra');
+          const stealth = require('puppeteer-extra-plugin-stealth')();
+          chromium.use(stealth);
 
           (async () => {
             const url = process.argv[2];
-            // Create a safe file name from the URL
             const safeName = url.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-            const outputPath = `${safeName}.png`;
+            const outputPath = `downloads/${safeName}.png`;
 
-            const browser = await chromium.launch();
+            // Launch the browser using the stealth-enabled chromium
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            
             const page = await browser.newPage();
-
-            // Set a standard desktop resolution to ensure a good layout
             await page.setViewportSize({ width: 1920, height: 1080 });
 
             try {
               console.log(`Navigating to ${url}...`);
-              // Using 'load' instead of 'networkidle' to prevent timeouts!
               await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+
+              // Wait to clear potential Cloudflare Turnstile verification
+              console.log('Waiting to clear potential Cloudflare redirects...');
+              await page.waitForTimeout(5000);
 
               console.log('Scrolling down to trigger lazy-loaded movie posters...');
               await page.evaluate(async () => {
@@ -66,18 +74,15 @@ jobs:
                       clearInterval(timer);
                       resolve();
                     }
-                  }, 200); // Scrolldown speed
+                  }, 200);
                 });
               });
 
-              // Wait 2 extra seconds after scrolling finishes
-              // Why? Because downloading the image is one thing, but the browser 
-              // needs a fraction of a second to 'paint' it onto the screen.
+              // Give images a final moment to render after scrolling
               console.log('Waiting for final images to render...');
               await page.waitForTimeout(2000); 
 
               console.log(`Taking full-page screenshot...`);
-              // fullPage: true tells Playwright to capture the entire scrollable height
               await page.screenshot({ path: outputPath, fullPage: true });
               console.log(`Successfully saved screenshot to ${outputPath}`);
               
@@ -89,47 +94,65 @@ jobs:
           })();
           EOF
 
-      - name: Extract URLs and Run Playwright
+      # 4. Extract URLs from your commit message and run the script
+      - name: Extract URLs and Capture Screenshots
         run: |
-          # Extract URLs from the commit message
-          URLS=$(git log -1 --pretty=%B | grep -Eo "(http|https)://[a-zA-Z0-9./?=_%:-]*")
+          mkdir -p downloads
+          
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+          
+          # Prevent infinite loops when the bot commits the image back
+          if [[ "$COMMIT_MSG" == *"[skip ci]"* ]]; then
+            echo "Skipping CI to prevent infinite loop."
+            exit 0
+          fi
+          
+          URLS=$(echo "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
           
           if [ -z "$URLS" ]; then
             echo "No URLs found in the commit message."
-            exit 0
+          else
+            for URL in $URLS; do
+              echo "Processing: $URL"
+              node archiver.js "$URL"
+            done
           fi
 
-          for URL in $URLS; do
-            echo "Processing URL: $URL"
-            node archiver.js "$URL"
-          done
-
-      - name: Handle Large Files (Split files > 90MB)
+      # 5. Split files if they are somehow over GitHub's 90MB limit
+      - name: Split Large Files (> 90MB)
         run: |
-          # GitHub has a strict 100MB file size limit. 
-          # Full-page screenshots of very long lists can sometimes exceed this.
-          find . -name "*.png" -size +90M | while read FILE; do
-            echo "Splitting large file: $FILE"
-            zip -s 90m "${FILE}.zip" "$FILE"
-            rm "$FILE" # Remove the original massive file to prevent GitHub rejection
+          cd downloads
+          for file in *; do
+            if [ -f "$file" ]; then
+              filesize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
+              if [ "$filesize" -gt 94371840 ]; then
+                echo "Splitting $file because it's larger than 90MB..."
+                zip -s 90m "${file}.zip" "$file"
+                rm "$file"
+              fi
+            fi
           done
+          cd ..
 
-      - name: Commit and Push
+      # 6. Clean up the messy Node.js temporary files
+      - name: Cleanup temporary files
+        run: |
+          rm -f archiver.js
+          rm -f package.json package-lock.json
+          rm -rf node_modules
+
+      # 7. Commit the new images back to the repository
+      - name: Commit and Push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads/
           
-          # Clean up temporary Node files before committing
-          rm -f archiver.js package.json package-lock.json
-          rm -rf node_modules
-          
-          git add .
-          
-          # Check if there are any changes to commit
-          if git diff-index --quiet HEAD; then
+          if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            # [skip ci] is crucial! It stops this commit from triggering the workflow again.
-            git commit -m "Add screenshot archive for extracted URLs [skip ci]"
+            # [skip ci] is crucial here so this commit doesn't trigger another run
+            git commit -m "Add new screenshots [skip ci]"
             git push
           fi
