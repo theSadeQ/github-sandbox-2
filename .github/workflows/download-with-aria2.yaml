@@ -1,84 +1,130 @@
-name: Download from Commit & Save to Repo
+name: Auto Download on Commit Command
+
 on:
   push:
     branches:
-      - "**"
+      - '**'
+
+permissions:
+  contents: write
+
 jobs:
-  save-file:
+  download:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install aria2
-        run: sudo apt-get install -y aria2
-
-      - name: Extract URLs and download files
+          fetch-depth: 2
+      
+      - name: Install dependencies
         run: |
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
-
-          if echo "$MSG" | grep -qP 'download-zip:'; then
+          sudo apt-get update
+          sudo apt-get install -y aria2 wget zip
+      
+      - name: Parse commit message and download
+        run: |
+          set -e
+          
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+          
+          if [[ ! "$COMMIT_MSG" =~ (download:|download-zip:) ]]; then
+            echo "No download command found"
+            exit 0
+          fi
+          
+          MODE="normal"
+          if [[ "$COMMIT_MSG" =~ download-zip: ]]; then
             MODE="zip"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            MODE="normal"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
+            echo "Mode: download and zip"
           else
-            echo "❌ No download command found in commit message"
-            exit 1
+            echo "Mode: normal download"
           fi
-
-          echo "Mode: $MODE"
-          mkdir -p downloads tmp_downloads
-
-          for URL in $URL_LINE; do
-            FILENAME=$(basename "$URL")
-            echo "⬇️ Downloading $URL -> $FILENAME"
-
-            aria2c \
-              --split=2 \
-              --max-connection-per-server=2 \
-              --min-split-size=90M \
-              --dir="tmp_downloads" \
-              "$URL"
-          done
-
-          if [ "$MODE" = "zip" ]; then
-            ARCHIVE_NAME="tmp_downloads/archive_$(date +%Y%m%d_%H%M%S).zip"
-            zip -j "$ARCHIVE_NAME" tmp_downloads/*
+          
+          URLS=$(echo "$COMMIT_MSG" | grep -oP '(download(-zip)?:)\s*\K.*' || true)
+          
+          if [ -z "$URLS" ]; then
+            echo "No URLs found"
+            exit 0
           fi
-
-          # Split any zip over 90MB using zip native split (unzip compatible)
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
-            LIMIT=$((90 * 1024 * 1024))
-            BASENAME=$(basename "$FILE")
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — splitting with zip..."
-              # zip -s creates: file.zip, file.z01, file.z02, ...
-              #zip -s 90m "downloads/${BASENAME}.zip" --out "downloads/${BASENAME}.zip" "$FILE"
-              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
-              echo "✅ Parts: $(ls downloads/${BASENAME}* | wc -l)"
+          
+          echo "URLs: $URLS"
+          
+          mkdir -p tmp_downloads downloads
+          cd tmp_downloads
+          
+          for URL in $URLS; do
+            echo "Processing: $URL"
+            
+            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|dmg|iso|doc|docx|xls|xlsx|ppt|pptx)$ ]]; then
+              echo "Downloading file with aria2c"
+              aria2c -x 16 -s 16 "$URL" || wget -c "$URL"
             else
-              cp "$FILE" "downloads/$BASENAME"
+              echo "Downloading webpage with wget"
+              wget --page-requisites --convert-links --adjust-extension \
+                   --span-hosts --no-parent --restrict-file-names=windows \
+                   -e robots=off "$URL"
             fi
           done
-
-          rm -rf tmp_downloads
-
-      - name: Commit & Push
+          
+          cd ..
+          
+          if [ "$MODE" = "zip" ]; then
+            echo "Creating zip archive"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            ARCHIVE_NAME="download_${TIMESTAMP}"
+            
+            cd tmp_downloads
+            zip -r "../${ARCHIVE_NAME}.zip" .
+            cd ..
+            
+            FILESIZE=$(stat -c%s "${ARCHIVE_NAME}.zip" 2>/dev/null || stat -f%z "${ARCHIVE_NAME}.zip")
+            FILESIZE_MB=$((FILESIZE / 1024 / 1024))
+            
+            echo "Archive size: ${FILESIZE_MB}MB"
+            
+            if [ $FILESIZE_MB -gt 90 ]; then
+              echo "Splitting archive (>90MB)"
+              rm "${ARCHIVE_NAME}.zip"
+              cd tmp_downloads
+              zip -s 90m -r "../downloads/${ARCHIVE_NAME}.zip" .
+              cd ..
+            else
+              mv "${ARCHIVE_NAME}.zip" downloads/
+            fi
+          else
+            echo "Moving files individually"
+            find tmp_downloads -type f | while read -r file; do
+              FILESIZE=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
+              FILESIZE_MB=$((FILESIZE / 1024 / 1024))
+              BASENAME=$(basename "$file")
+              
+              if [ $FILESIZE_MB -gt 90 ]; then
+                echo "Splitting $BASENAME (${FILESIZE_MB}MB)"
+                TMPDIR=$(mktemp -d)
+                cp "$file" "$TMPDIR/"
+                cd "$TMPDIR"
+                zip -s 90m "${BASENAME}.zip" "$BASENAME"
+                mv *.zip "$GITHUB_WORKSPACE/downloads/"
+                cd "$GITHUB_WORKSPACE"
+                rm -rf "$TMPDIR"
+              else
+                mv "$file" downloads/
+              fi
+            done
+          fi
+      
+      - name: Commit downloaded files
         run: |
-          BRANCH="${GITHUB_REF_NAME}"
+          set -e
+          
           git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add downloads/
-          git commit -m "Add downloaded files from commit [skip ci]" || echo "Nothing to commit"
-          echo "🚀 Pushing to branch: $BRANCH"
-          git push origin HEAD:$BRANCH
+          git config user.email "actions@github.com"
+          
+          git add downloads
+          
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
