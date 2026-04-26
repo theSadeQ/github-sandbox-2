@@ -18,74 +18,91 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 wget zip
-          
-          # Install monolith for proper web archiving
-          wget -q https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O /tmp/monolith
-          sudo install /tmp/monolith /usr/local/bin/
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 wget zip
 
-      - name: Parse commit message and download
+      - name: Parse and Download
         run: |
-          set -u  # Only fail on undefined variables, not command failures
-
           COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "=== Commit message ==="
+          echo "::group::Commit Message"
           echo "$COMMIT_MSG"
-          echo "======================"
+          echo "::endgroup::"
 
-          if ! echo "$COMMIT_MSG" | grep -qE '(download:|download-zip:)'; then
-            echo "No download command found. Exiting gracefully."
-            exit 0
-          fi
-
-          MODE="normal"
+          # Detect mode
+          MODE="none"
           if echo "$COMMIT_MSG" | grep -q 'download-zip:'; then
             MODE="zip"
+          elif echo "$COMMIT_MSG" | grep -q 'download:'; then
+            MODE="normal"
           fi
-          echo "Mode: $MODE"
 
-          # Extract URLs more safely
-          URLS=$(echo "$COMMIT_MSG" | grep -oP '(?<=download(-zip)?:\s).*' | tr ' ' '\n' | grep -E '^https?://')
-
-          if [ -z "$URLS" ]; then
-            echo "No valid URLs detected. Exiting."
+          if [ "$MODE" = "none" ]; then
+            echo "No download command found. Skipping."
             exit 0
           fi
 
-          echo "=== URLs to download ==="
+          echo "Mode: $MODE"
+
+          # Extract URLs safely
+          URLS=$(echo "$COMMIT_MSG" | sed -n 's/.*download\(-zip\)\{0,1\}:\s*//p' | tr ' ' '\n' | grep -E '^https?://' || true)
+
+          if [ -z "$URLS" ]; then
+            echo "No valid URLs found in commit message."
+            exit 0
+          fi
+
+          echo "::group::URLs Found"
           echo "$URLS"
-          echo "========================"
+          echo "::endgroup::"
 
-          rm -rf tmp_downloads
           mkdir -p tmp_downloads downloads
-
-          cd tmp_downloads
+          SUCCESS=0
+          FAIL=0
 
           for URL in $URLS; do
-            echo "Processing: $URL"
+            echo "-----------------------------------"
+            echo "Downloading: $URL"
 
-            # Check if it's a direct file
-            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso|doc|docx|xls|xlsx|ppt|pptx|apk|dmg)$ ]]; then
-              echo "  → Direct file download"
-              aria2c -x 8 -s 8 "$URL" || wget -c "$URL" || echo "Failed to download $URL"
+            # Check if direct file by extension
+            if echo "$URL" | grep -qiE '\.(jpg|jpeg|png|gif|webp|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso|doc|docx|xls|xlsx|ppt|pptx|apk|dmg|svg|bmp|wav|flac|mkv|avi|mov)$'; then
+              echo "  Type: Direct file"
+              if aria2c -x 8 -s 8 -d tmp_downloads "$URL" 2>&1; then
+                echo "  ✅ Success (aria2c)"
+                SUCCESS=$((SUCCESS+1))
+              elif wget -q -P tmp_downloads "$URL" 2>&1; then
+                echo "  ✅ Success (wget fallback)"
+                SUCCESS=$((SUCCESS+1))
+              else
+                echo "  ❌ Failed to download: $URL"
+                FAIL=$((FAIL+1))
+              fi
             else
-              echo "  → Web page archive"
+              echo "  Type: Web page"
               DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|' | tr '.' '_')
-              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-              OUTPUT="${DOMAIN}_${TIMESTAMP}.html"
-              
-              monolith "$URL" -o "$OUTPUT" || echo "Failed to archive $URL"
+              STAMP=$(date +%Y%m%d_%H%M%S)
+              OUTFILE="tmp_downloads/${DOMAIN}_${STAMP}.html"
+
+              if wget -q --convert-links --adjust-extension -O "$OUTFILE" "$URL" 2>&1; then
+                echo "  ✅ Saved as $OUTFILE"
+                SUCCESS=$((SUCCESS+1))
+              else
+                echo "  ❌ Failed to save: $URL"
+                rm -f "$OUTFILE"
+                FAIL=$((FAIL+1))
+              fi
             fi
           done
 
-          cd ..
+          echo "==================================="
+          echo "Results: $SUCCESS succeeded, $FAIL failed"
+          echo "==================================="
 
           # Check if anything was downloaded
-          if [ ! -d "tmp_downloads" ] || [ -z "$(ls -A tmp_downloads 2>/dev/null)" ]; then
-            echo "Nothing was downloaded successfully. Exiting."
+          FILE_COUNT=$(find tmp_downloads -type f 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "No files downloaded. Nothing to commit."
             exit 0
           fi
 
@@ -93,23 +110,46 @@ jobs:
 
           if [ "$MODE" = "zip" ]; then
             NAME="download_$(date +%Y%m%d_%H%M%S)"
-            zip -r "${NAME}.zip" tmp_downloads
+            cd tmp_downloads
+            zip -r "../${NAME}.zip" . || true
+            cd ..
 
-            SIZE=$(stat -c%s "${NAME}.zip")
+            SIZE=$(stat -c%s "${NAME}.zip" 2>/dev/null || echo 0)
             if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Archive exceeds 90MB, splitting..."
-              rm "${NAME}.zip"
-              cd tmp_downloads
-              zip -s 90m -r "../downloads/${NAME}.zip" .
-              cd ..
+              echo "Splitting archive (>90MB)..."
+              zip -s 90m "${NAME}.zip" --out "downloads/${NAME}_split.zip" || true
+              rm -f "${NAME}.zip"
             else
               mv "${NAME}.zip" downloads/
             fi
           else
-            # Normal download mode
             find tmp_downloads -type f | while read FILE; do
-              SIZE=$(stat -c%s "$FILE")
               BASENAME=$(basename "$FILE")
+              SIZE=$(stat -c%s "$FILE")
 
               if [ "$SIZE" -gt "$LIMIT" ]; then
-                echo "File $BASENAME exceed
+                echo "Splitting $BASENAME (>90MB)..."
+                NOEXT="${BASENAME%.*}"
+                zip -s 90m "downloads/${NOEXT}.zip" "$FILE" || true
+              else
+                cp "$FILE" "downloads/$BASENAME"
+              fi
+            done
+          fi
+
+          rm -rf tmp_downloads
+
+      - name: Commit and Push
+        run: |
+          FILE_COUNT=$(find downloads -type f 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads/
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m "📦 Auto-download from commit command"
+          git push
