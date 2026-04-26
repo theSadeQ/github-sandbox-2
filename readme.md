@@ -1,1 +1,1 @@
-download: https://letterboxd.com/rockwerks/list/52-thrillers-at-the-movies-2025/
+download: https://www.billboard.com/charts/hot-100/
