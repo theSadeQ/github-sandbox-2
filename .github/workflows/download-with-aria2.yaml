@@ -1,58 +1,122 @@
-name: Archive URLs from Commits
+name: Download URLs from Commit Message
 
-# 1. When should this run? (Adjust branch name if yours is 'master' instead of 'main')
+# Trigger the workflow whenever a push is made to the repository
 on:
   push:
     branches:
-      - main
+      - main # Note: Change this to 'master' if your default branch is named master
 
-# 2. Grant the GitHub Actions bot permission to push code back to the repository
+# GRANT PERMISSIONS: This is required so the bot is legally allowed to push files back
 permissions:
   contents: write
 
-# 3. Define the jobs
 jobs:
-  archive-job:
+  download-and-commit:
     runs-on: ubuntu-latest
-    
-    # 4. The steps are a sequence (list), so THIS is where the hyphens (-) start
+
     steps:
+      # 1. Check out the code
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetches all history, which helps prevent git push issues
+          # fetch-depth: 0 pulls the entire history so 'git log' can properly read the commit message
+          fetch-depth: 0
 
+      # 2. Install Tools (aria2 via apt, monolith via direct download)
       - name: Install dependencies
         run: |
           sudo apt-get update
-          # Assuming you need aria2 and monolith based on our previous discussions
-          sudo apt-get install -y aria2 monolith
+          
+          # Install aria2
+          sudo apt-get install -y aria2
+          
+          # Download and install monolith directly since it's not in apt
+          echo "Downloading monolith..."
+          wget -q https://github.com/Y2Z/monolith/releases/latest/download/monolith-gnu-linux-x86_64 -O monolith
+          chmod +x monolith
+          sudo mv monolith /usr/local/bin/
+          
+          # Verify installations
+          aria2c --version | head -n 1
+          monolith --version
 
-      - name: Parse and Download
+      # 3. Read the message, extract URLs, and download
+      - name: Parse commit and download
         run: |
+          # Strict bash mode: fail on hidden errors, log all commands
           set -euxo pipefail
-          # [PASTE YOUR WORKING DOWNLOAD BASH SCRIPT HERE]
-          echo "Placeholder for download script"
+          
+          # Get the latest commit message
+          MESSAGE=$(git log -1 --pretty=format:"%B")
+          
+          # Extract URLs safely (|| true prevents grep from failing the script if no URLs exist)
+          urls=$(echo "$MESSAGE" | grep -Eo 'https?://[^ ]+' || true)
+          
+          # Stop cleanly if there are no URLs
+          if [ -z "$urls" ]; then
+            echo "No URLs found in the commit message."
+            exit 0
+          fi
+          
+          # Read through the URLs line by line
+          while read -r url; do
+            if [ -z "$url" ]; then
+              continue
+            fi
+            
+            # Sanitize: Remove accidental trailing punctuation caught by regex
+            url=$(echo "$url" | sed -E 's/[.,;)]+$//')
+            echo "Processing URL: $url"
+            
+            # Extract filename from URL
+            FILENAME=$(basename "$url")
+            if [ -z "$FILENAME" ] || [ "$FILENAME" = "/" ]; then
+              FILENAME="index.html"
+            fi
+            
+            # Strip query parameters (?id=123) from the filename string
+            FILENAME=$(echo "$FILENAME" | cut -d'?' -f1)
+            
+            # Truncate filename to max 200 chars to avoid OS file system limits
+            FILENAME=${FILENAME:0:200}
+            
+            # Logic branch: Use monolith for webpages, aria2c for files
+            if echo "$url" | grep -iqE '\.html?$|/$' || [ "$FILENAME" = "index.html" ]; then
+              echo "Saving webpage with monolith..."
+              # 'if !' syntax catches 403 Forbidden errors so the workflow logs a warning instead of crashing
+              if ! monolith "$url" -o "$FILENAME.html"; then
+                echo "::warning::Monolith failed to download $url. The site might be blocking bots."
+              fi
+            else
+              echo "Downloading file with aria2c..."
+              # --parameterized-uri=false stops aria2c from crashing with exit code 2 on bracketed links
+              if ! aria2c --parameterized-uri=false "$url"; then
+                echo "::warning::aria2c failed to download $url."
+              fi
+            fi
+          done <<< "$urls"
 
+      # 4. Save the files to the repo
       - name: Commit downloads
         run: |
           set -euxo pipefail
           
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Set up the bot's Git identity
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          mkdir -p downloads
-          git add downloads/
+          # Stage the newly downloaded files
+          git add .
           
-          # Check for changes cleanly
+          # Check if there are actually any changes (prevents git commit from crashing if downloads failed)
           if [ -n "$(git status --porcelain)" ]; then
-            echo "Changes detected, committing..."
-            git commit -m "Add offline webpage archives"
+            git commit -m "Auto-downloaded files from commit URLs"
             
-            # Pull with rebase to prevent Exit Code 1 (Non-Fast-Forward)
+            # Pull with rebase: This prevents 'Non-Fast-Forward' push rejections if the repo changed while downloading
             git pull --rebase origin ${GITHUB_REF_NAME}
             
+            # Push changes to the branch that triggered the workflow
             git push origin HEAD:${GITHUB_REF_NAME}
           else
-            echo "No new files were downloaded or changed. Skipping commit."
+            echo "No new downloaded files to commit."
           fi
