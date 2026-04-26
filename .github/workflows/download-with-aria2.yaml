@@ -1,121 +1,154 @@
-name: Archive Webpages & Split Large Files
+name: Download Dynamic Webpages via Commit Message
+
 on:
   push:
     branches:
-      - "**"
-
-permissions:
-  contents: write
+      - '*' # Triggers on push to any branch
 
 jobs:
-  archive-and-save:
+  download-and-commit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          
-          # Install zip/unzip to ensure we can split massive files
-          sudo apt-get update
-          sudo apt-get install -y zip unzip
-          
-          echo "Compiling monolith via Cargo (this ensures compatibility with the latest Ubuntu)..."
-          # cargo is Rust's package manager. It is pre-installed on GitHub Actions.
-          cargo install monolith
-          
-          # Move the compiled binary to a global bin folder so other steps can use it
-          sudo cp ~/.cargo/bin/monolith /usr/local/bin/
-          
-          # Verify installation
-          monolith --version
+      # 1. We swap out Rust/Cargo for Node.js, which is required to run Playwright
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Parse, Download, and Split
+      # 2. Install Playwright and the headless Chromium browser
+      - name: Install Playwright
         run: |
-          set -euo pipefail
-          
-          # Extract commit message
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
-          
-          # Safely extract URLs starting with http:// or https://
-          URLS=$(echo "$MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
-          
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Install Zip utilities
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
+
+      # 3. Create the Archiver Script
+      # We dynamically create a JavaScript file that controls the browser.
+      - name: Create Playwright Script
+        run: |
+          cat << 'EOF' > archiver.js
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          (async () => {
+            const url = process.argv[2];
+            const outputPath = process.argv[3];
+            
+            if (!url || !outputPath) {
+              console.error("Usage: node archiver.js <URL> <OUTPUT_FILE>");
+              process.exit(1);
+            }
+
+            console.log(`Launching browser to archive: ${url}`);
+            const browser = await chromium.launch();
+            const page = await browser.newPage();
+
+            try {
+              // Wait for the network to be completely quiet so initial scripts load
+              await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+
+              // DESIGN CHOICE: Auto-scroller
+              // Many sites (like Letterboxd) only load images when they enter the screen.
+              // We simulate a user scrolling to the bottom to trigger all image downloads.
+              console.log("Scrolling down the page to trigger lazy loading...");
+              await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                  let totalHeight = 0;
+                  const distance = 200; // Scroll 200 pixels down every 100ms
+                  const timer = setInterval(() => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+
+                    if (totalHeight >= scrollHeight - window.innerHeight) {
+                      clearInterval(timer);
+                      resolve();
+                    }
+                  }, 100);
+                });
+              });
+
+              // Give it a brief pause (3 seconds) for the final images to arrive
+              await page.waitForTimeout(3000);
+
+              // Grab the fully processed HTML and save it
+              const content = await page.content();
+              fs.writeFileSync(outputPath, content);
+              console.log(`Successfully saved HTML to ${outputPath}`);
+            } catch (error) {
+              console.error(`Failed to process ${url}:`, error);
+            } finally {
+              await browser.close();
+            }
+          })();
+          EOF
+
+      - name: Process URLs from Commit Message
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+
+          # Extract URLs based on regex
+          URLS=$(echo "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
+
           if [ -z "$URLS" ]; then
-            echo "❌ No URLs found in the commit message."
+            echo "No URLs found in the commit message."
             exit 0
           fi
-          
-          # Create temporary processing dir and final output dir
+
           mkdir -p tmp_downloads downloads
-          
-          # 1. DOWNLOAD PHASE
-          while IFS= read -r url; do
-            [ -z "$url" ] && continue
+
+          for url in $URLS; do
+            # Sanitize the URL for file naming
+            clean_url=$(echo "$url" | sed -e 's/[<>]//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            filename=$(echo "$clean_url" | sed -e 's|^https*://||' -e 's|[^a-zA-Z0-9]|_|g' | cut -c 1-150).html
             
-            # Strip trailing punctuation for cleaner links
-            clean_url=$(echo "$url" | sed -E 's/[.,;)]+$//')
+            echo "Processing: $clean_url"
             
-            # Create a safe filename (replace weird characters with underscores)
-            safe_name=$(echo "$clean_url" | sed -E 's/[^a-zA-Z0-9]/_/g')
-            # Truncate to 150 chars to avoid OS "File name too long" errors
-            filename="${safe_name:0:150}.html"
-            
-            echo "⬇️ Archiving: $clean_url"
-            
-            # Run monolith. 
-            # -f (no iframes/ads), -v (no videos), -a (no audio)
-            # Note: No '-i' flag, so IMAGES WILL BE KEPT
-            monolith -f -v -a "$clean_url" -o "tmp_downloads/$filename" || echo "::warning::Failed to archive $clean_url"
-          done <<< "$URLS"
-          
-          # 2. SPLIT PHASE
-          for FILE in tmp_downloads/*; do
-            # Skip if no files exist
-            [ -f "$FILE" ] || continue
-            
-            SIZE=$(stat -c%s "$FILE")
-            LIMIT=$((90 * 1024 * 1024)) # 90 MB in bytes
-            BASENAME=$(basename "$FILE")
-            
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ $BASENAME is $(( SIZE / 1024 / 1024 ))MB — larger than 90MB. Splitting with zip..."
+            # Execute our new Node script instead of monolith
+            node archiver.js "$clean_url" "tmp_downloads/$filename"
+          done
+
+      - name: Manage File Sizes
+        run: |
+          mkdir -p downloads
+          for file in tmp_downloads/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              filesize=$(stat -c%s "$file")
               
-              # zip -s creates: file.zip, file.z01, file.z02, etc.
-              # -j removes the 'tmp_downloads/' folder structure from inside the zip
-              zip -s 90m "downloads/${BASENAME}.zip" -j "$FILE"
-              
-              echo "✅ Created Parts: $(ls downloads/${BASENAME}* | wc -l)"
-            else
-              echo "✅ $BASENAME is $(( SIZE / 1024 / 1024 ))MB. No splitting needed."
-              cp "$FILE" "downloads/$BASENAME"
+              if [ "$filesize" -gt 94371840 ]; then
+                echo "$filename is larger than 90MB. Zipping and splitting..."
+                zip -s 90m "downloads/${filename}.zip" "$file"
+              else
+                cp "$file" "downloads/"
+              fi
             fi
           done
-          
-          # Clean up the temporary heavy files
-          rm -rf tmp_downloads
+          # Clean up temporary script and Node modules so they don't get committed
+          rm -rf tmp_downloads archiver.js package.json node_modules
 
       - name: Commit and Push
         run: |
-          set -euo pipefail
-          BRANCH="${GITHUB_REF_NAME}"
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Add the contents of the downloads folder
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git add downloads/
           
-          # Check if there are actually files to commit to prevent errors
-          if git diff --cached --quiet; then
-            echo "No new downloads to commit."
+          if ! git diff-index --quiet HEAD; then
+            # The [skip ci] tag is a best practice to prevent GitHub Actions from running in an infinite loop!
+            git commit -m "Add downloaded web pages via Playwright [skip ci]"
+            git push
           else
-            git commit -m "Add downloaded files from commit [skip ci]"
-            echo "🚀 Pushing to branch: $BRANCH"
-            git pull --rebase origin $BRANCH
-            git push origin HEAD:$BRANCH
+            echo "No new files to commit."
           fi
