@@ -1,3 +1,39 @@
+name: Archive URLs from Commits
+
+# 1. When should this run? (Adjust branch name if yours is 'master' instead of 'main')
+on:
+  push:
+    branches:
+      - main
+
+# 2. Grant the GitHub Actions bot permission to push code back to the repository
+permissions:
+  contents: write
+
+# 3. Define the jobs
+jobs:
+  archive-job:
+    runs-on: ubuntu-latest
+    
+    # 4. The steps are a sequence (list), so THIS is where the hyphens (-) start
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches all history, which helps prevent git push issues
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # Assuming you need aria2 and monolith based on our previous discussions
+          sudo apt-get install -y aria2 monolith
+
+      - name: Parse and Download
+        run: |
+          set -euxo pipefail
+          # [PASTE YOUR WORKING DOWNLOAD BASH SCRIPT HERE]
+          echo "Placeholder for download script"
+
       - name: Commit downloads
         run: |
           set -euxo pipefail
@@ -5,19 +41,15 @@
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Ensure directory exists so git add doesn't fail
           mkdir -p downloads
           git add downloads/
           
-          # FIX 1: Use git status --porcelain. It outputs an empty string if nothing changed.
-          # This is the safest way to check for changes in CI/CD pipelines.
+          # Check for changes cleanly
           if [ -n "$(git status --porcelain)" ]; then
             echo "Changes detected, committing..."
             git commit -m "Add offline webpage archives"
             
-            # FIX 2: Pull with rebase before pushing.
-            # If the server has newer commits, this safely stacks your new downloads
-            # on top of them, preventing the Exit Code 1 push rejection.
+            # Pull with rebase to prevent Exit Code 1 (Non-Fast-Forward)
             git pull --rebase origin ${GITHUB_REF_NAME}
             
             git push origin HEAD:${GITHUB_REF_NAME}
