@@ -1,94 +1,115 @@
-name: Download from Commit & Save to Repo
+name: Auto Download on Commit Command
 
 on:
   push:
     branches:
-      - "**"
+      - '**'
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+permissions:
+  contents: write
 
 jobs:
   download:
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: write
-
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 wget zip
+          
+          # Install monolith for proper web archiving
+          wget -q https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O /tmp/monolith
+          sudo install /tmp/monolith /usr/local/bin/
 
-      - name: Parse commit and download
+      - name: Parse commit message and download
         run: |
-          set -e
+          set -u  # Only fail on undefined variables, not command failures
 
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "=== Commit message ==="
+          echo "$COMMIT_MSG"
+          echo "======================"
 
-          MODE=""
-          URLS=""
-
-          if echo "$MSG" | grep -q "download-zip:"; then
-            MODE="zip"
-            URLS=$(echo "$MSG" | sed -n 's/.*download-zip:[[:space:]]*//p')
-          elif echo "$MSG" | grep -q "download:"; then
-            MODE="normal"
-            URLS=$(echo "$MSG" | sed -n 's/.*download:[[:space:]]*//p')
-          else
-            echo "No download command found"
+          if ! echo "$COMMIT_MSG" | grep -qE '(download:|download-zip:)'; then
+            echo "No download command found. Exiting gracefully."
             exit 0
           fi
 
-          mkdir -p tmp_downloads downloads
+          MODE="normal"
+          if echo "$COMMIT_MSG" | grep -q 'download-zip:'; then
+            MODE="zip"
+          fi
+          echo "Mode: $MODE"
 
-          for URL in $URLS; do
-            echo "Downloading: $URL"
+          # Extract URLs more safely
+          URLS=$(echo "$COMMIT_MSG" | grep -oP '(?<=download(-zip)?:\s).*' | tr ' ' '\n' | grep -E '^https?://')
 
-            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|webp|mp4|zip|pdf|mp3|tar|gz|7z)$ ]]; then
-              aria2c -d tmp_downloads "$URL"
-            else
-              wget \
-                --page-requisites \
-                --convert-links \
-                --no-parent \
-                -P tmp_downloads \
-                "$URL"
-            fi
-          done
-
-          if [ "$MODE" = "zip" ]; then
-            ZIP="downloads/archive_$(date +%s).zip"
-            zip -r "$ZIP" tmp_downloads/*
-          else
-            cp -r tmp_downloads/* downloads/ || true
+          if [ -z "$URLS" ]; then
+            echo "No valid URLs detected. Exiting."
+            exit 0
           fi
 
-          LIMIT=$((90 * 1024 * 1024))
+          echo "=== URLs to download ==="
+          echo "$URLS"
+          echo "========================"
 
-          for FILE in downloads/*; do
-            [ -f "$FILE" ] || continue
-            SIZE=$(stat -c%s "$FILE")
+          rm -rf tmp_downloads
+          mkdir -p tmp_downloads downloads
 
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "Splitting $FILE"
-              zip -s 90m "${FILE}.zip" "$FILE"
-              rm "$FILE"
+          cd tmp_downloads
+
+          for URL in $URLS; do
+            echo "Processing: $URL"
+
+            # Check if it's a direct file
+            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso|doc|docx|xls|xlsx|ppt|pptx|apk|dmg)$ ]]; then
+              echo "  → Direct file download"
+              aria2c -x 8 -s 8 "$URL" || wget -c "$URL" || echo "Failed to download $URL"
+            else
+              echo "  → Web page archive"
+              DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|' | tr '.' '_')
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              OUTPUT="${DOMAIN}_${TIMESTAMP}.html"
+              
+              monolith "$URL" -o "$OUTPUT" || echo "Failed to archive $URL"
             fi
           done
 
-      - name: Commit files
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          cd ..
 
-          git add downloads/
+          # Check if anything was downloaded
+          if [ ! -d "tmp_downloads" ] || [ -z "$(ls -A tmp_downloads 2>/dev/null)" ]; then
+            echo "Nothing was downloaded successfully. Exiting."
+            exit 0
+          fi
 
-          git commit -m "Add downloaded files [skip ci]" || echo "Nothing to commit"
+          LIMIT=$((90*1024*1024))
 
-          git push
+          if [ "$MODE" = "zip" ]; then
+            NAME="download_$(date +%Y%m%d_%H%M%S)"
+            zip -r "${NAME}.zip" tmp_downloads
+
+            SIZE=$(stat -c%s "${NAME}.zip")
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Archive exceeds 90MB, splitting..."
+              rm "${NAME}.zip"
+              cd tmp_downloads
+              zip -s 90m -r "../downloads/${NAME}.zip" .
+              cd ..
+            else
+              mv "${NAME}.zip" downloads/
+            fi
+          else
+            # Normal download mode
+            find tmp_downloads -type f | while read FILE; do
+              SIZE=$(stat -c%s "$FILE")
+              BASENAME=$(basename "$FILE")
+
+              if [ "$SIZE" -gt "$LIMIT" ]; then
+                echo "File $BASENAME exceed
