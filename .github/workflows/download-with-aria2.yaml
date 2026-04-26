@@ -1,121 +1,110 @@
-name: Auto Download on Commit Command
+name: Download from Commit Message
 
 on:
   push:
     branches:
-      - '**'
-
-permissions:
-  contents: write
+      - main
 
 jobs:
   download:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 wget zip bc
+          sudo apt-get update
+          sudo apt-get install -y wget aria2 zip bc
           
-          # Install monolith
-          wget -q https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O /tmp/monolith
-          chmod +x /tmp/monolith
-          sudo mv /tmp/monolith /usr/local/bin/monolith
+          # Install monolith safely
+          wget -q --show-progress https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O monolith
+          chmod +x monolith
+          sudo mv monolith /usr/local/bin/
           
-          # Verify installation
-          if ! command -v monolith &> /dev/null; then
-            echo "❌ monolith installation failed"
-            exit 1
-          fi
-          echo "✅ monolith installed: $(monolith --version)"
+          echo "Verifying monolith installation..."
+          monolith --version
 
       - name: Parse and Download
         run: |
-          set -u
+          # Enforce strict error handling
+          set -euo pipefail
           
+          # 1. Safely extract commit message using printf (avoids echo evaluating flags like -e)
           COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "::group::Commit Message"
-          echo "$COMMIT_MSG"
-          echo "::endgroup::"
-
-          MODE="none"
-          if echo "$COMMIT_MSG" | grep -q 'download-zip:'; then
-            MODE="zip"
-          elif echo "$COMMIT_MSG" | grep -q 'download:'; then
-            MODE="normal"
-          fi
-
-          if [ "$MODE" = "none" ]; then
-            echo "ℹ️  No download command found"
-            exit 0
-          fi
-
-          echo "Mode: $MODE"
-
-          URLS=$(echo "$COMMIT_MSG" | sed -n 's/.*download\(-zip\)\{0,1\}:\s*//p' | tr ' ' '\n' | grep -E '^https?://' || true)
-
+          printf "Commit message:\n%s\n" "$COMMIT_MSG"
+          
+          # 2. Extract URLs securely without -P (PCRE)
+          # Matches http/https, stopping at spaces, quotes, or angle brackets
+          URLS=$(printf '%s\n' "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
+          
           if [ -z "$URLS" ]; then
-            echo "ℹ️  No valid URLs found"
+            echo "No URLs found in commit message"
             exit 0
           fi
-
-          echo "::group::URLs"
-          echo "$URLS"
-          echo "::endgroup::"
-
-          mkdir -p tmp_downloads downloads
-          SUCCESS=0
-          FAIL=0
-
-          for URL in $URLS; do
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📥 $URL"
-
-            # Check if direct file
-            if echo "$URL" | grep -qiE '\.(jpg|jpeg|png|gif|webp|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso|doc|docx|xls|xlsx|ppt|pptx|apk|dmg|svg|bmp|wav|flac|mkv|avi|mov|bin|deb|rpm)$'; then
-              echo "   Type: Direct file"
-              if aria2c -x 8 -s 8 -d tmp_downloads "$URL" 2>&1 | tail -5; then
-                echo "   ✅ Downloaded (aria2c)"
-                SUCCESS=$((SUCCESS+1))
-              elif wget -q -P tmp_downloads "$URL"; then
-                echo "   ✅ Downloaded (wget)"
-                SUCCESS=$((SUCCESS+1))
-              else
-                echo "   ❌ Failed"
-                FAIL=$((FAIL+1))
-              fi
+          
+          echo "Found URLs:"
+          printf '%s\n' "$URLS"
+          
+          mkdir -p downloads
+          
+          # 3. Process URLs via Here-String to avoid brittle pipeline subshells
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            
+            # Sanitize URL: Strip trailing markdown/text punctuation
+            url=$(printf '%s\n' "$url" | sed -E 's/[.,;)]+$//')
+            
+            printf "\nProcessing: %s\n" "$url"
+            
+            # Detect file vs webpage (Using [?] instead of \? for portable ERE syntax)
+            if printf '%s\n' "$url" | grep -qE '\.(zip|tar|gz|pdf|exe|dmg|apk|jpg|png|mp4|mp3)([?]|$)'; then
+              echo "Downloading file..."
+              
+              # --parameterized-uri=false prevents aria2c Exit Code 2 on URL brackets
+              wget -P downloads/ "$url" || aria2c --parameterized-uri=false -d downloads/ "$url" || echo "Download failed: $url"
+            
             else
-              # Web page
-              echo "   Type: Web page (archiving with monolith)"
-              DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|' | tr '.' '_' | tr '/' '_')
-              STAMP=$(date +%Y%m%d_%H%M%S)
-              OUTFILE="tmp_downloads/${DOMAIN}_${STAMP}.html"
-
-              if monolith "$URL" -o "$OUTFILE" -I -j -s 2>&1 | tail -5; then
-                if [ -f "$OUTFILE" ]; then
-                  SIZE=$(stat -c%s "$OUTFILE")
-                  SIZE_MB=$(echo "scale=2; $SIZE/1024/1024" | bc)
-                  echo "   ✅ Archived: $OUTFILE ($SIZE_MB MB)"
-                  SUCCESS=$((SUCCESS+1))
-                else
-                  echo "   ❌ File not created"
-                  FAIL=$((FAIL+1))
-                fi
-              else
-                echo "   ❌ monolith failed"
-                rm -f "$OUTFILE"
-                FAIL=$((FAIL+1))
-              fi
+              echo "Archiving webpage..."
+              
+              # Create a safe filename and truncate to avoid OS "File name too long" errors
+              FILENAME=$(printf '%s\n' "$url" | sed -E 's|https?://||' | sed 's|[^a-zA-Z0-9]|_|g')
+              FILENAME=${FILENAME:0:200} 
+              
+              monolith "$url" -o "downloads/${FILENAME}.html" || echo "Archive failed: $url"
             fi
-          done
+          done <<< "$URLS"
+          
+          # 4. Final verification using bash arrays (safer than parsing ls)
+          shopt -s nullglob
+          DOWNLOADED_FILES=(downloads/*)
+          
+          if [ ${#DOWNLOADED_FILES[@]} -eq 0 ]; then
+            echo "No files downloaded"
+            exit 0
+          fi
+          
+          if command -v bc &> /dev/null; then
+            TOTAL_SIZE=$(du -sb downloads | awk '{print $1}')
+            SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1048576" | bc)
+            echo "Total downloaded: ${SIZE_MB} MB"
+          fi
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📊 Results: $SUCCESS succeeded, $FAIL failed"
-
-          FILE_COUNT=$(find tmp
+      - name: Commit downloads
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          shopt -s nullglob
+          DOWNLOADED_FILES=(downloads/*)
+          
+          if [ ${#DOWNLOADED_FILES[@]} -gt 0 ]; then
+            git add downloads/
+            git commit -m "Add downloaded files from commit" || echo "Nothing to commit"
+            git push
+          else
+            echo "No files to commit"
+          fi
