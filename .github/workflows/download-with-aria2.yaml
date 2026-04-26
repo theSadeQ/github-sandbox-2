@@ -21,15 +21,24 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 wget zip
+          sudo apt-get install -y -qq aria2 wget zip bc
           
-          # Install monolith for offline web archiving
+          # Install monolith
           wget -q https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O /tmp/monolith
           chmod +x /tmp/monolith
-          sudo mv /tmp/monolith /usr/local/bin/
+          sudo mv /tmp/monolith /usr/local/bin/monolith
+          
+          # Verify installation
+          if ! command -v monolith &> /dev/null; then
+            echo "❌ monolith installation failed"
+            exit 1
+          fi
+          echo "✅ monolith installed: $(monolith --version)"
 
       - name: Parse and Download
         run: |
+          set -u
+          
           COMMIT_MSG=$(git log -1 --pretty=%B)
           echo "::group::Commit Message"
           echo "$COMMIT_MSG"
@@ -43,7 +52,7 @@ jobs:
           fi
 
           if [ "$MODE" = "none" ]; then
-            echo "No download command found. Skipping."
+            echo "ℹ️  No download command found"
             exit 0
           fi
 
@@ -52,11 +61,11 @@ jobs:
           URLS=$(echo "$COMMIT_MSG" | sed -n 's/.*download\(-zip\)\{0,1\}:\s*//p' | tr ' ' '\n' | grep -E '^https?://' || true)
 
           if [ -z "$URLS" ]; then
-            echo "No valid URLs found."
+            echo "ℹ️  No valid URLs found"
             exit 0
           fi
 
-          echo "::group::URLs Found"
+          echo "::group::URLs"
           echo "$URLS"
           echo "::endgroup::"
 
@@ -65,53 +74,48 @@ jobs:
           FAIL=0
 
           for URL in $URLS; do
-            echo "-----------------------------------"
-            echo "Downloading: $URL"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📥 $URL"
 
-            # Direct file extensions
+            # Check if direct file
             if echo "$URL" | grep -qiE '\.(jpg|jpeg|png|gif|webp|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso|doc|docx|xls|xlsx|ppt|pptx|apk|dmg|svg|bmp|wav|flac|mkv|avi|mov|bin|deb|rpm)$'; then
-              echo "  Type: Direct file"
-              if aria2c -x 8 -s 8 -d tmp_downloads "$URL" 2>&1; then
-                echo "  ✅ Success (aria2c)"
+              echo "   Type: Direct file"
+              if aria2c -x 8 -s 8 -d tmp_downloads "$URL" 2>&1 | tail -5; then
+                echo "   ✅ Downloaded (aria2c)"
                 SUCCESS=$((SUCCESS+1))
-              elif wget -q -P tmp_downloads "$URL" 2>&1; then
-                echo "  ✅ Success (wget)"
+              elif wget -q -P tmp_downloads "$URL"; then
+                echo "   ✅ Downloaded (wget)"
                 SUCCESS=$((SUCCESS+1))
               else
-                echo "  ❌ Failed"
+                echo "   ❌ Failed"
                 FAIL=$((FAIL+1))
               fi
             else
-              # Web page - archive with monolith (embeds everything)
-              echo "  Type: Web page (archiving with monolith)"
+              # Web page
+              echo "   Type: Web page (archiving with monolith)"
               DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|' | tr '.' '_' | tr '/' '_')
               STAMP=$(date +%Y%m%d_%H%M%S)
               OUTFILE="tmp_downloads/${DOMAIN}_${STAMP}.html"
 
-              if monolith "$URL" -o "$OUTFILE" -I -j -s 2>&1; then
-                SIZE=$(stat -c%s "$OUTFILE" 2>/dev/null || echo 0)
-                SIZE_MB=$(echo "scale=2; $SIZE/1024/1024" | bc)
-                echo "  ✅ Saved as $OUTFILE ($SIZE_MB MB, fully offline)"
-                SUCCESS=$((SUCCESS+1))
+              if monolith "$URL" -o "$OUTFILE" -I -j -s 2>&1 | tail -5; then
+                if [ -f "$OUTFILE" ]; then
+                  SIZE=$(stat -c%s "$OUTFILE")
+                  SIZE_MB=$(echo "scale=2; $SIZE/1024/1024" | bc)
+                  echo "   ✅ Archived: $OUTFILE ($SIZE_MB MB)"
+                  SUCCESS=$((SUCCESS+1))
+                else
+                  echo "   ❌ File not created"
+                  FAIL=$((FAIL+1))
+                fi
               else
-                echo "  ❌ Failed to archive"
+                echo "   ❌ monolith failed"
                 rm -f "$OUTFILE"
                 FAIL=$((FAIL+1))
               fi
             fi
           done
 
-          echo "==================================="
-          echo "Results: $SUCCESS succeeded, $FAIL failed"
-          echo "==================================="
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 Results: $SUCCESS succeeded, $FAIL failed"
 
-          FILE_COUNT=$(find tmp_downloads -type f 2>/dev/null | wc -l)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "No files downloaded."
-            exit 0
-          fi
-
-          LIMIT=$((90*1024*1024))
-
-          if [ "$MODE" = "zip" ]; then
-            NAME
+          FILE_COUNT=$(find tmp
