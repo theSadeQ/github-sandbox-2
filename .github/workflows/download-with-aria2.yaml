@@ -24,21 +24,16 @@ jobs:
           wget -q --show-progress https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O monolith
           chmod +x monolith
           sudo mv monolith /usr/local/bin/
-          
-          echo "Verifying monolith installation..."
-          monolith --version
 
       - name: Parse and Download
         run: |
-          # Enforce strict error handling
           set -euo pipefail
           
-          # 1. Safely extract commit message using printf (avoids echo evaluating flags like -e)
+          # 1. Safely extract commit message
           COMMIT_MSG=$(git log -1 --pretty=%B)
           printf "Commit message:\n%s\n" "$COMMIT_MSG"
           
-          # 2. Extract URLs securely without -P (PCRE)
-          # Matches http/https, stopping at spaces, quotes, or angle brackets
+          # 2. Extract URLs securely
           URLS=$(printf '%s\n' "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
           
           if [ -z "$URLS" ]; then
@@ -46,65 +41,31 @@ jobs:
             exit 0
           fi
           
-          echo "Found URLs:"
-          printf '%s\n' "$URLS"
-          
           mkdir -p downloads
           
-          # 3. Process URLs via Here-String to avoid brittle pipeline subshells
+          # 3. Process URLs via Here-String
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             
-            # Sanitize URL: Strip trailing markdown/text punctuation
             url=$(printf '%s\n' "$url" | sed -E 's/[.,;)]+$//')
-            
             printf "\nProcessing: %s\n" "$url"
             
-            # Detect file vs webpage (Using [?] instead of \? for portable ERE syntax)
             if printf '%s\n' "$url" | grep -qE '\.(zip|tar|gz|pdf|exe|dmg|apk|jpg|png|mp4|mp3)([?]|$)'; then
               echo "Downloading file..."
-              
-              # --parameterized-uri=false prevents aria2c Exit Code 2 on URL brackets
               wget -P downloads/ "$url" || aria2c --parameterized-uri=false -d downloads/ "$url" || echo "Download failed: $url"
-            
             else
               echo "Archiving webpage..."
-              
-              # Create a safe filename and truncate to avoid OS "File name too long" errors
               FILENAME=$(printf '%s\n' "$url" | sed -E 's|https?://||' | sed 's|[^a-zA-Z0-9]|_|g')
               FILENAME=${FILENAME:0:200} 
-              
               monolith "$url" -o "downloads/${FILENAME}.html" || echo "Archive failed: $url"
             fi
           done <<< "$URLS"
-          
-          # 4. Final verification using bash arrays (safer than parsing ls)
-          shopt -s nullglob
-          DOWNLOADED_FILES=(downloads/*)
-          
-          if [ ${#DOWNLOADED_FILES[@]} -eq 0 ]; then
-            echo "No files downloaded"
-            exit 0
-          fi
-          
-          if command -v bc &> /dev/null; then
-            TOTAL_SIZE=$(du -sb downloads | awk '{print $1}')
-            SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1048576" | bc)
-            echo "Total downloaded: ${SIZE_MB} MB"
-          fi
 
-      - name: Commit downloads
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          shopt -s nullglob
-          DOWNLOADED_FILES=(downloads/*)
-          
-          if [ ${#DOWNLOADED_FILES[@]} -gt 0 ]; then
-            git add downloads/
-            git commit -m "Add downloaded files from commit" || echo "Nothing to commit"
-            git push
-          else
-            echo "No files to commit"
-          fi
+      # NEW APPROACH: Upload as Artifact instead of Git Commit
+      - name: Upload Downloads as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: commit-downloads
+          path: downloads/
+          if-no-files-found: ignore
+          retention-days: 30
