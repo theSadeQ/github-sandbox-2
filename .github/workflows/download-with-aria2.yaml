@@ -19,14 +19,19 @@ jobs:
       - name: Install dependencies
         run: |
           set -euo pipefail
-          # Install zip to ensure we can split files, and wget for downloading monolith
-          sudo apt-get update
-          sudo apt-get install -y wget zip unzip
           
-          # Install monolith binary
-          wget -qO monolith https://github.com/Y2Z/monolith/releases/download/v2.8.1/monolith-gnu-linux-x86_64
-          chmod +x monolith
-          sudo mv monolith /usr/local/bin/
+          # Install zip/unzip to ensure we can split massive files
+          sudo apt-get update
+          sudo apt-get install -y zip unzip
+          
+          echo "Compiling monolith via Cargo (this ensures compatibility with the latest Ubuntu)..."
+          # cargo is Rust's package manager. It is pre-installed on GitHub Actions.
+          cargo install monolith
+          
+          # Move the compiled binary to a global bin folder so other steps can use it
+          sudo cp ~/.cargo/bin/monolith /usr/local/bin/
+          
+          # Verify installation
           monolith --version
 
       - name: Parse, Download, and Split
@@ -38,7 +43,6 @@ jobs:
           echo "Commit message: $MSG"
           
           # Safely extract URLs starting with http:// or https://
-          # Using grep -E instead of grep -P to avoid UTF-8 Exit Code 2 errors
           URLS=$(echo "$MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
           
           if [ -z "$URLS" ]; then
@@ -64,8 +68,8 @@ jobs:
             echo "⬇️ Archiving: $clean_url"
             
             # Run monolith. 
-            # Removed -i to KEEP images. 
             # -f (no iframes/ads), -v (no videos), -a (no audio)
+            # Note: No '-i' flag, so IMAGES WILL BE KEPT
             monolith -f -v -a "$clean_url" -o "tmp_downloads/$filename" || echo "::warning::Failed to archive $clean_url"
           done <<< "$URLS"
           
