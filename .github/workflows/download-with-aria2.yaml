@@ -1,12 +1,14 @@
-name: Download Dynamic Webpages via Commit Message
+name: Webpage Screenshot Archiver
 
 on:
   push:
-    branches:
-      - '*' # Triggers on push to any branch
+    paths-ignore:
+      - '**/*.png'
+      - '**/*.zip'
+  workflow_dispatch:
 
 jobs:
-  download-and-commit:
+  screenshot:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,138 +19,117 @@ jobs:
         with:
           fetch-depth: 2
 
-      # 1. We swap out Rust/Cargo for Node.js, which is required to run Playwright
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 2. Install Playwright and the headless Chromium browser
-      - name: Install Playwright
+      - name: Install Playwright and Dependencies
         run: |
           npm init -y
           npm install playwright
           npx playwright install --with-deps chromium
 
-      - name: Install Zip utilities
-        run: sudo apt-get update && sudo apt-get install -y zip unzip
-
-      # 3. Create the Archiver Script
-      # We dynamically create a JavaScript file that controls the browser.
-      - name: Create Playwright Script
+      - name: Create Archiver Script
         run: |
           cat << 'EOF' > archiver.js
           const { chromium } = require('playwright');
-          const fs = require('fs');
 
           (async () => {
             const url = process.argv[2];
-            const outputPath = process.argv[3];
-            
-            if (!url || !outputPath) {
-              console.error("Usage: node archiver.js <URL> <OUTPUT_FILE>");
-              process.exit(1);
-            }
+            // Create a safe file name from the URL
+            const safeName = url.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+            const outputPath = `${safeName}.png`;
 
-            console.log(`Launching browser to archive: ${url}`);
             const browser = await chromium.launch();
             const page = await browser.newPage();
 
+            // Set a standard desktop resolution to ensure a good layout
+            await page.setViewportSize({ width: 1920, height: 1080 });
+
             try {
-              // Wait for the network to be completely quiet so initial scripts load
+              console.log(`Navigating to ${url}...`);
+              // Using 'load' instead of 'networkidle' to prevent timeouts!
               await page.goto(url, { waitUntil: 'load', timeout: 60000 });
 
-              // DESIGN CHOICE: Auto-scroller
-              // Many sites (like Letterboxd) only load images when they enter the screen.
-              // We simulate a user scrolling to the bottom to trigger all image downloads.
-              console.log("Scrolling down the page to trigger lazy loading...");
+              console.log('Scrolling down to trigger lazy-loaded movie posters...');
               await page.evaluate(async () => {
                 await new Promise((resolve) => {
                   let totalHeight = 0;
-                  const distance = 200; // Scroll 200 pixels down every 100ms
+                  const distance = 300;
                   const timer = setInterval(() => {
                     const scrollHeight = document.body.scrollHeight;
                     window.scrollBy(0, distance);
                     totalHeight += distance;
-
-                    if (totalHeight >= scrollHeight - window.innerHeight) {
+                    
+                    if (totalHeight >= scrollHeight) {
                       clearInterval(timer);
                       resolve();
                     }
-                  }, 100);
+                  }, 200); // Scrolldown speed
                 });
               });
 
-              // Give it a brief pause (3 seconds) for the final images to arrive
-              await page.waitForTimeout(3000);
+              // Wait 2 extra seconds after scrolling finishes
+              // Why? Because downloading the image is one thing, but the browser 
+              // needs a fraction of a second to 'paint' it onto the screen.
+              console.log('Waiting for final images to render...');
+              await page.waitForTimeout(2000); 
 
-              // Grab the fully processed HTML and save it
-              const content = await page.content();
-              fs.writeFileSync(outputPath, content);
-              console.log(`Successfully saved HTML to ${outputPath}`);
-            } catch (error) {
-              console.error(`Failed to process ${url}:`, error);
+              console.log(`Taking full-page screenshot...`);
+              // fullPage: true tells Playwright to capture the entire scrollable height
+              await page.screenshot({ path: outputPath, fullPage: true });
+              console.log(`Successfully saved screenshot to ${outputPath}`);
+              
+            } catch (err) {
+              console.error(`Error processing ${url}:`, err);
             } finally {
               await browser.close();
             }
           })();
           EOF
 
-      - name: Process URLs from Commit Message
+      - name: Extract URLs and Run Playwright
         run: |
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $COMMIT_MSG"
-
-          # Extract URLs based on regex
-          URLS=$(echo "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
-
+          # Extract URLs from the commit message
+          URLS=$(git log -1 --pretty=%B | grep -Eo "(http|https)://[a-zA-Z0-9./?=_%:-]*")
+          
           if [ -z "$URLS" ]; then
             echo "No URLs found in the commit message."
             exit 0
           fi
 
-          mkdir -p tmp_downloads downloads
-
-          for url in $URLS; do
-            # Sanitize the URL for file naming
-            clean_url=$(echo "$url" | sed -e 's/[<>]//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            filename=$(echo "$clean_url" | sed -e 's|^https*://||' -e 's|[^a-zA-Z0-9]|_|g' | cut -c 1-150).html
-            
-            echo "Processing: $clean_url"
-            
-            # Execute our new Node script instead of monolith
-            node archiver.js "$clean_url" "tmp_downloads/$filename"
+          for URL in $URLS; do
+            echo "Processing URL: $URL"
+            node archiver.js "$URL"
           done
 
-      - name: Manage File Sizes
+      - name: Handle Large Files (Split files > 90MB)
         run: |
-          mkdir -p downloads
-          for file in tmp_downloads/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              filesize=$(stat -c%s "$file")
-              
-              if [ "$filesize" -gt 94371840 ]; then
-                echo "$filename is larger than 90MB. Zipping and splitting..."
-                zip -s 90m "downloads/${filename}.zip" "$file"
-              else
-                cp "$file" "downloads/"
-              fi
-            fi
+          # GitHub has a strict 100MB file size limit. 
+          # Full-page screenshots of very long lists can sometimes exceed this.
+          find . -name "*.png" -size +90M | while read FILE; do
+            echo "Splitting large file: $FILE"
+            zip -s 90m "${FILE}.zip" "$FILE"
+            rm "$FILE" # Remove the original massive file to prevent GitHub rejection
           done
-          # Clean up temporary script and Node modules so they don't get committed
-          rm -rf tmp_downloads archiver.js package.json node_modules
 
       - name: Commit and Push
         run: |
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          if ! git diff-index --quiet HEAD; then
-            # The [skip ci] tag is a best practice to prevent GitHub Actions from running in an infinite loop!
-            git commit -m "Add downloaded web pages via Playwright [skip ci]"
-            git push
+          # Clean up temporary Node files before committing
+          rm -f archiver.js package.json package-lock.json
+          rm -rf node_modules
+          
+          git add .
+          
+          # Check if there are any changes to commit
+          if git diff-index --quiet HEAD; then
+            echo "No changes to commit."
           else
-            echo "No new files to commit."
+            # [skip ci] is crucial! It stops this commit from triggering the workflow again.
+            git commit -m "Add screenshot archive for extracted URLs [skip ci]"
+            git push
           fi
