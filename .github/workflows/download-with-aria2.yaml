@@ -11,120 +11,117 @@ permissions:
 jobs:
   download:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      
+
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 wget zip
-      
+
       - name: Parse commit message and download
         run: |
-          set -e
-          
+          set -u
+
           COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $COMMIT_MSG"
-          
-          if [[ ! "$COMMIT_MSG" =~ (download:|download-zip:) ]]; then
+          echo "Commit message:"
+          echo "$COMMIT_MSG"
+
+          if ! echo "$COMMIT_MSG" | grep -qE '(download:|download-zip:)'; then
             echo "No download command found"
             exit 0
           fi
-          
+
           MODE="normal"
-          if [[ "$COMMIT_MSG" =~ download-zip: ]]; then
-            MODE="zip"
-            echo "Mode: download and zip"
-          else
-            echo "Mode: normal download"
-          fi
-          
-          URLS=$(echo "$COMMIT_MSG" | grep -oP '(download(-zip)?:)\s*\K.*' || true)
-          
+          echo "$COMMIT_MSG" | grep -q 'download-zip:' && MODE="zip"
+          echo "Mode: $MODE"
+
+          URLS=$(echo "$COMMIT_MSG" \
+            | sed -n 's/.*download-zip:[[:space:]]*//p; s/.*download:[[:space:]]*//p')
+
           if [ -z "$URLS" ]; then
-            echo "No URLs found"
+            echo "No URLs detected"
             exit 0
           fi
-          
-          echo "URLs: $URLS"
-          
+
+          rm -rf tmp_downloads
           mkdir -p tmp_downloads downloads
+
           cd tmp_downloads
-          
+
           for URL in $URLS; do
-            echo "Processing: $URL"
-            
-            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|dmg|iso|doc|docx|xls|xlsx|ppt|pptx)$ ]]; then
-              echo "Downloading file with aria2c"
-              aria2c -x 16 -s 16 "$URL" || wget -c "$URL"
+            echo "Downloading: $URL"
+
+            if [[ "$URL" =~ \.(jpg|jpeg|png|gif|mp4|mp3|pdf|zip|tar|gz|rar|7z|exe|iso)$ ]]; then
+              aria2c -x 8 -s 8 "$URL" || wget -c "$URL" || true
             else
-              echo "Downloading webpage with wget"
-              wget --page-requisites --convert-links --adjust-extension \
-                   --span-hosts --no-parent --restrict-file-names=windows \
-                   -e robots=off "$URL"
+              wget \
+                --page-requisites \
+                --convert-links \
+                --adjust-extension \
+                --span-hosts \
+                --no-parent \
+                -e robots=off \
+                "$URL" || true
             fi
           done
-          
+
           cd ..
-          
+
+          if [ -z "$(find tmp_downloads -type f)" ]; then
+            echo "Nothing downloaded"
+            exit 0
+          fi
+
+          LIMIT=$((90*1024*1024))
+
           if [ "$MODE" = "zip" ]; then
-            echo "Creating zip archive"
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            ARCHIVE_NAME="download_${TIMESTAMP}"
-            
-            cd tmp_downloads
-            zip -r "../${ARCHIVE_NAME}.zip" .
-            cd ..
-            
-            FILESIZE=$(stat -c%s "${ARCHIVE_NAME}.zip" 2>/dev/null || stat -f%z "${ARCHIVE_NAME}.zip")
-            FILESIZE_MB=$((FILESIZE / 1024 / 1024))
-            
-            echo "Archive size: ${FILESIZE_MB}MB"
-            
-            if [ $FILESIZE_MB -gt 90 ]; then
-              echo "Splitting archive (>90MB)"
-              rm "${ARCHIVE_NAME}.zip"
+            NAME="download_$(date +%Y%m%d_%H%M%S)"
+            zip -r "${NAME}.zip" tmp_downloads
+
+            SIZE=$(stat -c%s "${NAME}.zip")
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              rm "${NAME}.zip"
               cd tmp_downloads
-              zip -s 90m -r "../downloads/${ARCHIVE_NAME}.zip" .
+              zip -s 90m -r "../downloads/${NAME}.zip" .
               cd ..
             else
-              mv "${ARCHIVE_NAME}.zip" downloads/
+              mv "${NAME}.zip" downloads/
             fi
           else
-            echo "Moving files individually"
-            find tmp_downloads -type f | while read -r file; do
-              FILESIZE=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file")
-              FILESIZE_MB=$((FILESIZE / 1024 / 1024))
-              BASENAME=$(basename "$file")
-              
-              if [ $FILESIZE_MB -gt 90 ]; then
-                echo "Splitting $BASENAME (${FILESIZE_MB}MB)"
-                TMPDIR=$(mktemp -d)
-                cp "$file" "$TMPDIR/"
-                cd "$TMPDIR"
-                zip -s 90m "${BASENAME}.zip" "$BASENAME"
+            find tmp_downloads -type f | while read FILE; do
+              SIZE=$(stat -c%s "$FILE")
+              BASE=$(basename "$FILE")
+
+              if [ "$SIZE" -gt "$LIMIT" ]; then
+                TMP=$(mktemp -d)
+                cp "$FILE" "$TMP/"
+                cd "$TMP"
+                zip -s 90m "${BASE}.zip" "$BASE"
                 mv *.zip "$GITHUB_WORKSPACE/downloads/"
                 cd "$GITHUB_WORKSPACE"
-                rm -rf "$TMPDIR"
+                rm -rf "$TMP"
               else
-                mv "$file" downloads/
+                mv "$FILE" downloads/
               fi
             done
           fi
-      
+
       - name: Commit downloaded files
         run: |
-          set -e
-          
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          
+
           git add downloads
-          
+
           if git diff --cached --quiet; then
             echo "Nothing to commit"
             exit 0
+          fi
+
+          git commit -m "Add downloaded files from commit command"
+          git push
