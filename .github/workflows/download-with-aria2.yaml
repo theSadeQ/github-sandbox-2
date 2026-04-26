@@ -1,72 +1,3 @@
-name: Download from Commit Message
-
-on:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: write
-
-jobs:
-  download:
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget aria2 zip
-          
-          wget -q --show-progress https://github.com/Y2Z/monolith/releases/download/v2.8.3/monolith-gnu-linux-x86_64 -O monolith
-          chmod +x monolith
-          sudo mv monolith /usr/local/bin/
-
-      - name: Parse and Download
-        run: |
-          # The 'x' enables Trace Mode. This will show us EXACTLY where it fails.
-          set -euxo pipefail
-          
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          URLS=$(printf '%s\n' "$COMMIT_MSG" | grep -Eo 'https?://[^[:space:]"'\''<>]+' || true)
-          
-          if [ -z "$URLS" ]; then
-            echo "No URLs found in commit message"
-            exit 0
-          fi
-          
-          mkdir -p downloads
-          
-          while IFS= read -r url; do
-            # FIX: Replaced bash shorthand (&&) with a full if-statement to prevent strict-mode crashes
-            if [ -z "$url" ]; then
-              continue
-            fi
-            
-            url=$(printf '%s\n' "$url" | sed -E 's/[.,;)]+$//')
-            
-            if printf '%s\n' "$url" | grep -qE '\.(zip|tar|gz|pdf|exe|dmg|apk|jpg|png|mp4|mp3)([?]|$)'; then
-              echo "Downloading file: $url"
-              wget -U "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -P downloads/ "$url" || true
-            else
-              echo "Archiving complete webpage: $url"
-              FILENAME=$(printf '%s\n' "$url" | sed -E 's|https?://||' | sed 's|[^a-zA-Z0-9]|_|g')
-              FILENAME=${FILENAME:0:200} 
-              
-              # FIX: Safely handle monolith errors without crashing the pipeline
-              if ! monolith "$url" -o "downloads/${FILENAME}.html"; then
-                echo "::warning::Failed to archive $url. The site may be blocking bots or requires Javascript rendering."
-              else
-                echo "Successfully created offline archive for $url"
-              fi
-            fi
-          done <<< "$URLS"
-
       - name: Commit downloads
         run: |
           set -euxo pipefail
@@ -74,13 +5,22 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
+          # Ensure directory exists so git add doesn't fail
           mkdir -p downloads
           git add downloads/
           
-          if ! git diff --cached --quiet; then
+          # FIX 1: Use git status --porcelain. It outputs an empty string if nothing changed.
+          # This is the safest way to check for changes in CI/CD pipelines.
+          if [ -n "$(git status --porcelain)" ]; then
             echo "Changes detected, committing..."
             git commit -m "Add offline webpage archives"
-            git push origin HEAD:${GITHUB_REF}
+            
+            # FIX 2: Pull with rebase before pushing.
+            # If the server has newer commits, this safely stacks your new downloads
+            # on top of them, preventing the Exit Code 1 push rejection.
+            git pull --rebase origin ${GITHUB_REF_NAME}
+            
+            git push origin HEAD:${GITHUB_REF_NAME}
           else
             echo "No new files were downloaded or changed. Skipping commit."
           fi
