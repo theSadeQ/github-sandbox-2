@@ -1,1 +1,1 @@
-download: https://letterboxd.com/films/popular/this/week/decade/2020s/language/english/download: https://letterboxd.com/films/popular/this/week/decade/2020s/language/english/
+download: https://subsource.net/subtitles/tracker-2024/season-1/english
