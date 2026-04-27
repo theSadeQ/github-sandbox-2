@@ -1,1 +1,1 @@
-download: https://www.image.google.com/search?q=sydney+sweeney+nude
+download: https://letterboxd.com/journal/how-to-use-our-new-and-improved-search/
