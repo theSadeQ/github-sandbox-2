@@ -1,1 +1,3 @@
-download: https://letterboxd.com/journal/how-to-use-our-new-and-improved-search/
+download: 
+https://linktr.ee/thebuffunicorn 
+https://www.famousbirthdays.com/people/thebuffunicornn.html
