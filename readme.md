@@ -1,3 +1,2 @@
 download: 
-https://linktr.ee/thebuffunicorn 
-https://www.famousbirthdays.com/people/thebuffunicornn.html
+https://starngage.com/plus/en-us/influencer/ranking/tiktok
